@@ -1,0 +1,182 @@
+#!/bin/bash
+
+#set -e
+POSTGRES_PASSWORD=pg-password
+DJANGO_SECRET_KEY=dj-secret-key
+ADMIN_EMAIL=me@example.com
+ADMIN_PASSWORD=fooofooo
+
+
+sudo apt-get update
+sudo apt-get install -y git-core build-essential autoconf automake libtool libncurses5 libncurses5-dev gawk zlib1g-dev pkg-config libssl-dev libpq-dev unixodbc-dev odbc-postgresql postgresql postgresql-client libpq-dev libxml2-dev libxslt-dev ntp ntpdate libapache2-mod-wsgi apache2 gcc python-setuptools python-pip libjpeg62 libjpeg62-dev libdbd-pg-perl libtext-csv-perl sqlite3 libsqlite3-dev libcurl4-openssl-dev libpcre3-dev libspeex-dev libspeexdsp-dev libldns-dev libedit-dev libmemcached-dev python-psycopg2 python-dev libgeoip-dev
+
+
+echo -n | openssl s_client -showcerts -connect stash.freeswitch.org:443 2>/dev/null  | sed -ne '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' >> /etc/ssl/certs/ca-certificates.crt
+
+cd /usr/src
+
+git clone -b v1.4 https://stash.freeswitch.org/scm/fs/freeswitch.git
+cd freeswitch
+./bootstrap.sh -j
+
+sed -i 's/#applications\/mod_esl/applications\/mod_esl/g' modules.conf
+sed -i 's/#applications\/mod_memcache/applications\/mod_memcache/g' modules.conf
+sed -i 's/#applications\/mod_nibblebill/applications\/mod_nibblebill/g' modules.conf
+sed -i 's/#codecs\/mod_siren/codecs\/mod_siren/g' modules.conf
+sed -i 's/#codecs\/mod_amrwb/codecs\/mod_amrwb/g' modules.conf
+
+echo "languages/mod_spidermonkey" >> modules.conf
+
+# after, do :
+
+./configure
+make
+make install
+
+# you need to compile esl for python
+
+cd libs/esl
+make pymod
+make pymod-install
+
+# create a freeswitch user and group as follow :
+
+sudo groupadd freeswitch
+sudo adduser --disabled-password --quiet --system --home /usr/local/freeswitch --gecos "FreeSWITCH Voice Platform" --ingroup daemon freeswitch
+
+# and to apply the rule to freeswitch user :
+
+sudo chown -R freeswitch:daemon /usr/local/freeswitch/
+sudo chmod -R ug=rwX,o= /usr/local/freeswitch/
+sudo chmod -R u=rwx,g=rx /usr/local/freeswitch/bin/
+
+# and now, we need to create the init script to start and stop freeswitch :
+sudo mv ~/freeswitch_init /etc/init.d/freeswitch
+
+#make this script executable :
+
+sudo chmod +x /etc/init.d/freeswitch
+sudo update-rc.d freeswitch defaults
+
+#add the cli link :
+
+sudo ln -s /usr/local/freeswitch/bin/fs_cli /bin/fs_cli
+
+#Postgresql configuration
+
+#create user and database :
+
+sudo -u postgres bash -c "psql -c \"CREATE ROLE pyfreebilling PASSWORD '$POSTGRES_PASSWORD' NOSUPERUSER CREATEDB CREATEROLE INHERIT LOGIN;\""
+sudo -u postgres bash -c "createdb -O pyfreebilling -E UTF8 pyfreebilling"
+
+# set odbc parameters; you need to create and edit /etc/odbc.ini file. Do not forget to specify your postgres password !
+
+sudo printf "[freeswitch]\nDriver = PostgreSQL\nDescription = Connection to POSTGRESQL\nServername = 127.0.0.1\nPort = 5432\nProtocol = 6.4\nFetchBufferSize = 99\nUsername = pyfreebilling\nPassword =$POSTGRES_PASSWORD\nDatabase = pyfreebilling\nReadOnly = no\nDebug = 0\nCommLog = 0\n" > /etc/odbc.ini
+
+# edit /etc/odbcinst.ini (delete all entries and add these ones)
+sudo rm /etc/odbcinst.ini
+sudo printf "[PostgreSQL]\nDescription = PostgreSQL ODBC driver (Unicode version)\nDriver = /usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so\nSetup = /usr/lib/x86_64-linux-gnu/odbc/libodbcpsqlS.so\nDebug = 0\nCommLog = 0\nUsageCount = 0\nThreading = 0\nMaxLongVarcharSize = 65536\n" > /etc/odbcinst.ini
+
+#Web server install
+#securing apache
+
+sudo a2enmod ssl
+sudo openssl req -nodes -x509 -newkey rsa:4096 -sha256 -keyout /etc/ssl/private/localhost.key -out /etc/ssl/private/localhost.crt -days 1095 -subj "/C=US/ST=Oregon/L=Portland/O=IT"
+sudo cat /etc/ssl/private/localhost.key > /etc/ssl/private/localhost.pem
+sudo cat /etc/ssl/private/localhost.crt >> /etc/ssl/private/localhost.pem
+
+
+#install python virtualenv
+
+pip install virtualenv
+cd /usr/local
+virtualenv venv --no-site-packages
+sudo chown -R root:root venv
+
+# activate it :
+source venv/bin/activate
+cd venv
+
+# install CPAN
+
+# install all dependent packages for CPAN
+
+# apt-get install build-essential
+# invoke the cpan command as a normal user :
+
+export PERL_MM_USE_DEFAULT=1
+export PERL_EXTUTILS_AUTOINSTALL="--defaultdeps"
+perl -MCPAN -Mlocal::lib=~/perl5 -e 'my $c = "CPAN::HandleConfig"; $c->load(doit => 1, autoconfig => 1); $c->edit(prerequisites_policy => "follow"); $c->edit(build_requires_install_policy => "yes"); $c->commit'
+perl -MCPAN -e 'notest install Bundle::CPAN'
+cpan Carp
+perl -MCPAN -e 'notest install Filter::Simple'
+perl -MCPAN -e 'notest install Config::Vars'
+
+# Pyfreebilling installation
+
+# download pyfreebilling sources :
+
+git clone https://github.com/mwolff44/pyfreebilling.git
+sudo chown -R www-data:www-data pyfreebilling
+cd pyfreebilling
+
+printf "# -*- coding: utf-8 -*-\nfrom .settings import *\nDEBUG = False\nMANAGERS = ADMINS\nDATABASES = {\n'default': {\n'ENGINE': 'django.db.backends.postgresql_psycopg2',\n'NAME': 'pyfreebilling',\n'USER': 'pyfreebilling',\n'PASSWORD': '$POSTGRES_PASSWORD',\n'HOST': '127.0.0.1',\n'PORT': '', # Set to empty string for default.\n}\n}\nALLOWED_HOSTS = ['*']\nSECRET_KEY = '$DJANGO_SECRET_KEY'\nTIME_ZONE = 'Europe/Paris'\nOPENEXCHANGERATES_APP_ID = 'Your API Key'\nPFB_NB_ADMIN_CDR = 3\nPFB_NB_CUST_CDR = 30\nTEMPLATED_EMAIL_BACKEND = 'templated_email.backends.vanilla_django.TemplateBackend'\nTEMPLATED_EMAIL_TEMPLATE_DIR = 'templated_email/'\nTEMPLATED_EMAIL_FILE_EXTENSION = 'email'\nEMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'\nEMAIL_HOST = ''\nEMAIL_PORT = 587\nEMAIL_HOST_USER = ''\nEMAIL_HOST_PASSWORD = ''\n#EMAIL_USE_TLS = True\nEMAIL_USE_SSL = True\nEMAIL_SIGNATURE = ''\n" > pyfreebilling/local_settings.py
+
+pip install -r requirements/requirements.txt
+
+python manage.py syncdb --noinput
+echo "from django.contrib.auth.models import User; User.objects.create_superuser('admin', '$ADMIN_EMAIL', '$ADMIN_PASSWORD')" | python manage.py shell
+python manage.py initcurrencies
+python manage.py migrate
+python manage.py loaddata country_dialcode.json
+python manage.py loaddata switch 0001_fixtures.json
+python manage.py loaddata 0001_initial_SipProfile.json
+python manage.py loaddata 0001_initial_ReccurentTasks.json
+python manage.py loaddata country.json
+python manage.py collectstatic --noinput
+
+# copy some config files :
+sudo cp -av /usr/local/venv/pyfreebilling/freeswitch/conf/autoload_configs/acl.conf.xml /usr/local/freeswitch/conf/autoload_configs/acl.conf.xml
+sudo cp -av /usr/local/venv/pyfreebilling/freeswitch/conf/autoload_configs/cdr_csv.conf.xml /usr/local/freeswitch/conf/autoload_configs/cdr_csv.conf.xml
+sudo cp -av /usr/local/venv/pyfreebilling/freeswitch/conf/autoload_configs/modules.conf.xml /usr/local/freeswitch/conf/autoload_configs/modules.conf.xml
+sudo cp -av /usr/local/venv/pyfreebilling/freeswitch/conf/autoload_configs/nibblebill.conf.xml /usr/local/freeswitch/conf/autoload_configs/nibblebill.conf.xml
+sudo cp -av /usr/local/venv/pyfreebilling/freeswitch/dialplan/pyfreebill.xml /usr/local/freeswitch/conf/dialplan/pyfreebill.xml
+sudo cp -av /usr/local/venv/pyfreebilling/freeswitch/dialplan/public/00_did.xml /usr/local/freeswitch/conf/dialplan/public/00_did.xml
+sudo cp -av /usr/local/venv/pyfreebilling/freeswitch/conf/freeswitch.xml /usr/local/freeswitch/conf/freeswitch.xml
+
+# copy freeswitch esl binaries to your virtual env directory
+cd /usr/src/freeswitch
+sudo cp libs/esl/python/ESL.py /usr/local/venv/lib/python2.7/site-packages/
+sudo cp libs/esl/python/_ESL.so /usr/local/venv/lib/python2.7/site-packages/
+# set good rights :
+
+sudo  rm -f /usr/local/freeswitch/conf/directory/default/*
+sudo chown -R freeswitch:freeswitch /usr/local/venv/pyfreebilling/freeswitch/scripts/
+sudo chmod 2750 /usr/local/freeswitch
+sudo chmod 2750 /usr/local/freeswitch/conf/
+sudo chmod 2750 /usr/local/freeswitch/conf/autoload_configs/
+sudo chmod 2750 /usr/local/freeswitch/conf/directory/
+sudo chmod 2750 /usr/local/freeswitch/conf/dialplan/
+sudo chmod 2750 /usr/local/freeswitch/conf/dialplan/public/
+sudo chmod 770 /usr/local/freeswitch/conf/directory/default.xml
+sudo chmod 770 /usr/local/freeswitch/conf/autoload_configs/sofia.conf.xml
+sudo chmod 770 /usr/local/freeswitch/conf/dialplan/public/00_did.xml
+sudo chown freeswitch:www-data -R /usr/local/freeswitch/
+sudo mkdir /tmp/cdr-csv/
+sudo chmod 777 -R /tmp/cdr-csv
+sudo touch /tmp/cdr-csv/Master.csv
+sudo chmod 600 /tmp/cdr-csv/Master.csv
+sudo chown freeswitch:freeswitch /tmp/cdr-csv/Master.csv
+sudo chown -R freeswitch:daemon /tmp/cdr-csv/
+# set apache config :
+
+sudo cp /usr/local/venv/pyfreebilling/setup/apache/001-pyfreebilling /etc/apache2/sites-enabled/000-default.conf
+sudo a2ensite 000-default
+sudo /etc/init.d/apache2 restart
+
+# set crontab :
+sudo touch /var/spool/crontab/root
+sudo crontab -l | { cat; echo "*/1 * * * * perl /usr/local/venv/pyfreebilling/freeswitch/scripts/import-csv.pl>> /var/log/cron.log 2>&1"; } | crontab -
+sudo crontab -l | { cat; echo "* * * * * /usr/local/venv/bin/chroniker -e /usr/local/venv/bin/activate_this.py -p /usr/local/venv/pyfreebilling"; } | crontab -
+
+sudo /etc/init.d/freeswitch restart
