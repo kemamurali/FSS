@@ -1,8 +1,5 @@
-# FSS
-Installation process with script  Ubuntu 14.04 64 bits LTS
+Installation process with script Ubuntu 14.04 64 bits LTS
 
-On script Instalaltion 
+chmod +x install.sh
 
-Shoudl work well with this
-
-thanks
+sudo ./install.sh
